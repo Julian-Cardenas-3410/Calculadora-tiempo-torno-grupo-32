@@ -1,0 +1,140 @@
+<!DOCTYPE html>
+<html lang="es"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Calculadora de Tiempo de Mecanizado G-Code (Torno)</title>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js"></script>
+<style>
+*{box-sizing:border-box}body{margin:0;font-family:Segoe UI,Arial,sans-serif;background:#f1f3f6;color:#222;font-size:14px}
+h1{color:#1a73e8;font-size:20px;margin:0;padding:14px 20px}
+.wrap{display:flex;gap:16px;padding:0 20px 20px;align-items:flex-start;flex-wrap:wrap}
+.card{background:#fff;border-radius:8px;box-shadow:0 1px 4px #0002;padding:14px}
+.left{flex:1 1 420px;max-width:560px}.right{flex:2 1 520px}
+label{display:flex;flex-direction:column;font-weight:600;font-size:12px;gap:3px}
+input,select,textarea{padding:6px;border:1px solid #ccc;border-radius:4px;font:inherit}
+textarea{width:100%;height:130px;font-family:Consolas,monospace;font-size:12px;resize:vertical}
+.row{display:flex;gap:10px;flex-wrap:wrap;margin-bottom:8px;align-items:flex-end}.row label{flex:1 1 90px}
+.cy{border-top:1px solid #e3e3e3;padding-top:8px;margin-top:8px}.cy h4{margin:0 0 6px;color:#1a73e8}
+.rpm{font-size:12px;color:#555;flex:1 1 140px;padding-bottom:7px}
+.tot{background:#e8f0fe;border-left:4px solid #1a73e8;padding:10px 12px;border-radius:4px;margin-bottom:10px}
+.tot b{color:#1a73e8;font-size:16px}
+.chips span{display:inline-block;background:#f1f3f6;border-radius:12px;padding:2px 10px;margin:0 6px 6px 0;font-size:12px}
+.tw{max-height:520px;overflow:auto;border:1px solid #e3e3e3}
+table{width:100%;border-collapse:collapse;font-size:12px}th,td{padding:6px 8px;text-align:center;border-bottom:1px solid #eee}
+th{background:#f7f7f7;position:sticky;top:0}td.i{font-family:Consolas,monospace;text-align:left;font-size:11px}
+tr.cyh td{background:#e8f0fe;font-weight:700;text-align:left}
+button{width:100%;margin-top:10px;padding:10px;border:0;border-radius:4px;background:#188038;color:#fff;font-weight:700;cursor:pointer;font-size:14px}
+small{color:#666}
+</style></head><body>
+<h1>Calculadora de Tiempo de Mecanizado G-Code (Torno)</h1>
+<div class="wrap">
+ <div class="card left">
+  <div class="row">
+   <label>Velocidad de corte Vc (m/min)<input id="vc" type="number" step="any" value="67"></label>
+   <label>N.º de ciclos<input id="n" type="number" min="1" max="20" value="5"></label>
+  </div>
+  <div class="row">
+   <label>X inicial (Ø)<input id="x0" type="number" step="any" value="96"></label>
+   <label>Z inicial<input id="z0" type="number" step="any" value="90"></label>
+   <label>Rápido G0 (mm/min)<input id="rap" type="number" step="any" value="3000"></label>
+  </div>
+  <div class="row">
+   <label>Avance desbaste (mm/rev)<input id="fd" type="number" step="any" value="0.44"></label>
+   <label>Avance acabado (mm/rev)<input id="fa" type="number" step="any" value="0.08"></label>
+  </div>
+  <small>S = 1000·Vc / (π·Ø) &nbsp;|&nbsp; F = S × avance. Cada ciclo continúa desde la posición final del anterior.</small>
+  <div id="cycles"></div>
+ </div>
+ <div class="card right">
+  <div class="tot"><b id="tt">Tiempo Total: 0m 0.00s</b><br>Total en segundos: <b id="ts" style="font-size:14px">0</b></div>
+  <div class="chips" id="chips"></div>
+  <div class="tw"><table><thead><tr><th>Línea</th><th>Instrucción</th><th>R (mm)</th><th>Ang (°)</th><th>Dist. Real (mm)</th><th>Velocidad (mm/min)</th><th>Tiempo (seg)</th></tr></thead><tbody id="tb"></tbody></table></div>
+  <button id="exp">Exportar a Excel</button>
+ </div>
+</div>
+<script>
+const $=id=>document.getElementById(id), g=id=>parseFloat($(id).value)||0;
+const cyc=[]; let rows=[], sums=[], total=0;
+function build(){
+  const n=Math.max(1,Math.min(20,parseInt($('n').value)||1));
+  while(cyc.length<n)cyc.push({d:'',tipo:'Desbaste',code:''});
+  cyc.length=n;
+  const box=$('cycles'); box.innerHTML='';
+  cyc.forEach((c,i)=>{
+    const d=document.createElement('div'); d.className='cy';
+    d.innerHTML=`<h4>Ciclo ${i+1}</h4><div class="row">
+    <label>Ø de trabajo (mm)<input type="number" step="any" data-i="${i}" data-k="d" value="${c.d}"></label>
+    <label>Tipo<select data-i="${i}" data-k="tipo"><option${c.tipo=='Desbaste'?' selected':''}>Desbaste</option><option${c.tipo=='Acabado'?' selected':''}>Acabado</option></select></label>
+    <span class="rpm" id="rpm${i}"></span></div>
+    <textarea data-i="${i}" data-k="code" placeholder="Pega aquí el código ISO del ciclo ${i+1}">${c.code}</textarea>`;
+    box.appendChild(d);
+  });
+  calc();
+}
+function calc(){
+  const Vc=g('vc'),fd=g('fd'),fa=g('fa'),rap=g('rap');
+  let x=g('x0'),z=g('z0'); rows=[]; sums=[]; total=0;
+  cyc.forEach((c,i)=>{
+    const D=parseFloat(c.d)||0, ac=c.tipo==='Acabado';
+    const S=D>0?Math.round(1000*Vc/(Math.PI*D)):0, F=Math.round(S*(ac?fa:fd));
+    $('rpm'+i).textContent=D>0?`S${S} rpm · F${F} mm/min`:'Ingresa el diámetro';
+    let mode=null, tot=0;
+    c.code.split('\n').forEach((raw,li)=>{
+      const s=raw.replace(/;.*$/,'').replace(/\(.*?\)/g,'').toUpperCase().trim();
+      if(!s)return;
+      const w={}, re=/([A-Z])\s*(-?\d*\.?\d+)/g; let m;
+      while(m=re.exec(s)){ if(m[1]==='G'){const v=+m[2]; if(v<=3)mode=v;} else w[m[1]]=+m[2]; }
+      if(mode===null||(w.X===undefined&&w.Z===undefined))return;
+      const nx=w.X!==undefined?w.X:x, nz=w.Z!==undefined?w.Z:z;
+      const dx=Math.abs(nx-x)/2, dz=nz-z, ch=Math.hypot(dx,dz);
+      let dist=ch,R=null,ang=null;
+      if(mode>=2){
+        R=w.R!==undefined?Math.abs(w.R):((w.I!==undefined||w.K!==undefined)?Math.hypot(w.I||0,w.K||0):null);
+        if(R){const a=Math.asin(Math.min(1,ch/(2*R))); let th=2*a; if(w.R<0)th=2*Math.PI-th; ang=a*180/Math.PI; dist=R*th;}
+      }
+      x=nx; z=nz;
+      if(dist<1e-9)return;
+      const v=mode===0?rap:F, t=v>0?dist/v*60:0; tot+=t;
+      rows.push({c:i+1,l:li+1,s,R,ang,dist,v,t});
+    });
+    total+=tot; sums.push({c:i+1,tipo:c.tipo,D,S,F,t:tot});
+  });
+  render();
+}
+const fmt=t=>`${Math.floor(t/60)}m ${(t%60).toFixed(2)}s`;
+function render(){
+  $('tt').textContent='Tiempo Total: '+fmt(total); $('ts').textContent=total.toFixed(2)+' s';
+  $('chips').innerHTML=sums.map(s=>`<span>Ciclo ${s.c}: ${fmt(s.t)}</span>`).join('');
+  let h='',last=0;
+  rows.forEach(r=>{
+    if(r.c!==last){last=r.c;h+=`<tr class="cyh"><td colspan="7">Ciclo ${r.c}</td></tr>`;}
+    h+=`<tr><td>L${r.l}</td><td class="i">${r.s}</td><td>${r.R?r.R.toFixed(3):'-'}</td><td>${r.ang?r.ang.toFixed(2):'-'}</td><td>${r.dist.toFixed(3)}</td><td>${r.v}</td><td><b>${r.t.toFixed(2)}</b></td></tr>`;
+  });
+  $('tb').innerHTML=h;
+}
+document.addEventListener('input',e=>{
+  const t=e.target; if(t.dataset.i!==undefined){cyc[+t.dataset.i][t.dataset.k]=t.value; calc();}
+  else if(t.id==='n')build(); else calc();
+});
+$('exp').onclick=()=>{
+  const head=['Ciclo','Línea','Instrucción','R (mm)','Ang (°)','Dist. Real (mm)','Velocidad (mm/min)','Tiempo (seg)'];
+  const a=[head,...rows.map(r=>[r.c,'L'+r.l,r.s,r.R?+r.R.toFixed(3):'-',r.ang?+r.ang.toFixed(2):'-',+r.dist.toFixed(3),r.v,+r.t.toFixed(2)])];
+  a.push([],['','','','','','','TOTAL (s)',+total.toFixed(2)]);
+  const b=[['Ciclo','Tipo','Ø (mm)','S (rpm)','F (mm/min)','Tiempo (seg)'],...sums.map(s=>[s.c,s.tipo,s.D,s.S,s.F,+s.t.toFixed(2)]),[],['','','','','TOTAL (s)',+total.toFixed(2)]];
+  if(typeof XLSX==='undefined'){
+    const csv=a.map(r=>r.join(';')).join('\n'), l=document.createElement('a');
+    l.href=URL.createObjectURL(new Blob(['\ufeff'+csv],{type:'text/csv'})); l.download='tiempos_torno.csv'; l.click(); return;
+  }
+  const wb=XLSX.utils.book_new();
+  sums.forEach(s=>{
+    const rs=rows.filter(r=>r.c===s.c);
+    const d=[head.slice(1),...rs.map(r=>['L'+r.l,r.s,r.R?+r.R.toFixed(3):'-',r.ang?+r.ang.toFixed(2):'-',+r.dist.toFixed(3),r.v,+r.t.toFixed(2)]),[],['','','','','','TOTAL (s)',+s.t.toFixed(2)]];
+    const ws=XLSX.utils.aoa_to_sheet(d);
+    ws['!cols']=[{wch:7},{wch:26},{wch:9},{wch:9},{wch:15},{wch:18},{wch:13}];
+    XLSX.utils.book_append_sheet(wb,ws,'Ciclo '+s.c);
+  });
+  const w2=XLSX.utils.aoa_to_sheet(b);
+  w2['!cols']=[{wch:7},{wch:11},{wch:9},{wch:9},{wch:12},{wch:13}];
+  XLSX.utils.book_append_sheet(wb,w2,'Resumen');
+  XLSX.writeFile(wb,'tiempos_torno.xlsx');
+};
+build();
+</script></body></html>
